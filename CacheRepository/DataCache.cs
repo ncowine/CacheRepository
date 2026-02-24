@@ -17,6 +17,7 @@ public abstract class DataCache<TKey, TValue> : IDataCache<TKey, TValue>
     private readonly ConcurrentDictionary<TKey, Lazy<Task<TValue>>> _inflightFetches = new();
 
     private readonly CacheOptions _options;
+    private readonly CacheMetrics _metrics;
     private readonly Channel<CacheChangeNotification<TKey>> _changeChannel;
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _changeProcessorTask;
@@ -25,6 +26,7 @@ public abstract class DataCache<TKey, TValue> : IDataCache<TKey, TValue>
     public DataCache(CacheOptions options = null)
     {
         _options = options ?? new CacheOptions();
+        _metrics = new CacheMetrics(GetType().Name, () => _store.Count);
 
         _changeChannel = Channel.CreateBounded<CacheChangeNotification<TKey>>(
             new BoundedChannelOptions(_options.ChangeQueueCapacity)
@@ -42,6 +44,7 @@ public abstract class DataCache<TKey, TValue> : IDataCache<TKey, TValue>
         if (TryGetFromStore(key, out var value))
             return value;
 
+        _metrics.Misses.Add(1);
         return await FetchAndCacheAsync(key);
     }
 
@@ -61,6 +64,10 @@ public abstract class DataCache<TKey, TValue> : IDataCache<TKey, TValue>
             else
                 keysToFetch.Add(key);
         }
+
+        var missCount = alreadyInflight.Count + keysToFetch.Count;
+        if (missCount > 0)
+            _metrics.Misses.Add(missCount);
 
         // Batch-fetch all truly missing keys in ONE db call.
         //
@@ -266,6 +273,8 @@ public abstract class DataCache<TKey, TValue> : IDataCache<TKey, TValue>
                 foreach (var key in keysToRemove)
                     _store.TryRemove(key, out _);
 
+                var removedCount = keysToRemove.Count;
+
                 // LRU eviction
                 if (_options.MaxItems.HasValue && _store.Count > _options.MaxItems.Value)
                 {
@@ -277,7 +286,12 @@ public abstract class DataCache<TKey, TValue> : IDataCache<TKey, TValue>
 
                     foreach (var key in excess)
                         _store.TryRemove(key, out _);
+
+                    removedCount += excess.Count;
                 }
+
+                if (removedCount > 0)
+                    _metrics.Evictions.Add(removedCount);
             }
         }
         catch (OperationCanceledException) { /* shutting down */ }
@@ -290,6 +304,7 @@ public abstract class DataCache<TKey, TValue> : IDataCache<TKey, TValue>
         {
             entry.Touch();
             value = entry.Value;
+            _metrics.Hits.Add(1);
             return true;
         }
         value = default;
@@ -308,6 +323,7 @@ public abstract class DataCache<TKey, TValue> : IDataCache<TKey, TValue>
         try { _purgeTask.GetAwaiter().GetResult(); } catch { }
 
         _cts.Dispose();
+        _metrics.Dispose();
         _store.Clear();
         _inflightFetches.Clear();
     }
