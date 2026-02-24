@@ -7,7 +7,13 @@ public abstract class DataCache<TKey, TValue> : IDataCache<TKey, TValue>
 {
     private readonly ConcurrentDictionary<TKey, CacheEntry<TValue>> _store = new();
 
-    // Coalesces concurrent fetches for the same key into one task
+    // Maps a key to its in-flight fetch task. When multiple callers request the same key
+    // concurrently, they all receive the SAME Lazy<Task> — so only one DB call is made.
+    // Lazy<Task<T>> is used (instead of just Task<T>) because:
+    //   - ConcurrentDictionary.GetOrAdd may invoke the factory on multiple threads,
+    //     but Lazy guarantees the inner factory (the actual DB call) runs exactly once.
+    //   - Without Lazy, two threads could both create separate Tasks before GetOrAdd
+    //     picks a winner, resulting in duplicate DB calls.
     private readonly ConcurrentDictionary<TKey, Lazy<Task<TValue>>> _inflightFetches = new();
 
     private readonly CacheOptions _options;
@@ -37,7 +43,6 @@ public abstract class DataCache<TKey, TValue> : IDataCache<TKey, TValue>
             return value;
 
         return await FetchAndCacheAsync(key);
-        throw new NotImplementedException();
     }
 
     public async Task<IReadOnlyDictionary<TKey, TValue>> Get(HashSet<TKey> keys)
@@ -57,8 +62,24 @@ public abstract class DataCache<TKey, TValue> : IDataCache<TKey, TValue>
                 keysToFetch.Add(key);
         }
 
-        // Batch-fetch all truly missing keys in ONE db call,
-        // but register per-key lazys so concurrent single-key Get() callers coalesce onto it
+        // Batch-fetch all truly missing keys in ONE db call.
+        //
+        // The challenge: _inflightFetches stores Lazy<Task<TValue>> (per-key), but the
+        // batch DB call returns all keys at once in a dictionary. We bridge this with
+        // two layers of Lazy:
+        //
+        // 1. batchLazy — wraps the single FetchBatchCoreAsync call. No matter how many
+        //    per-key lazys reference it, the DB call happens exactly once.
+        //
+        // 2. perKeyLazy (one per missing key) — awaits batchLazy.Value (the shared batch
+        //    result) and extracts just its own key. These get registered in _inflightFetches
+        //    so that a concurrent single-key Get(key) calling FetchAndCacheAsync will find
+        //    them via GetOrAdd and piggyback on the batch — no extra DB call.
+        //
+        // Example: Bulk Get({A,B,C}) runs while a concurrent Get(B) arrives.
+        //   - Bulk registers perKeyLazy for A, B, C in _inflightFetches
+        //   - Concurrent Get(B) calls GetOrAdd(B) → finds the existing perKeyLazy → awaits it
+        //   - All four callers (bulk + single) resolve from the same single batch DB call
         if (keysToFetch.Count > 0)
         {
             var batchLazy = new Lazy<Task<IReadOnlyDictionary<TKey, TValue>>>(
@@ -66,19 +87,21 @@ public abstract class DataCache<TKey, TValue> : IDataCache<TKey, TValue>
 
             foreach (var key in keysToFetch)
             {
-                var k = key;
+                var k = key; // capture for closure — loop variable would be wrong
                 var perKeyLazy = new Lazy<Task<TValue>>(async () =>
                 {
-                    var batchResult = await batchLazy.Value;
+                    var batchResult = await batchLazy.Value; // triggers the ONE batch DB call
                     return batchResult.TryGetValue(k, out var v) ? v : default;
                 });
 
+                // GetOrAdd: if another thread registered this key first, we get theirs instead
                 var registered = _inflightFetches.GetOrAdd(key, perKeyLazy);
                 alreadyInflight.Add((key, registered));
             }
         }
 
-        // Await all pending keys (pre-existing in-flight + our batch-derived)
+        // Await all pending keys (pre-existing in-flight from other callers + our batch-derived)
+        // Then clean up _inflightFetches so future requests create fresh fetches.
         var pendingTasks = alreadyInflight.Select(async item =>
         {
             try
@@ -87,6 +110,8 @@ public abstract class DataCache<TKey, TValue> : IDataCache<TKey, TValue>
             }
             finally
             {
+                // Remove only our specific Lazy instance (KeyValuePair overload),
+                // so we don't clobber a newer Lazy registered by a subsequent request
                 _inflightFetches.TryRemove(
                     new KeyValuePair<TKey, Lazy<Task<TValue>>>(item.key, item.lazy));
             }
@@ -101,6 +126,16 @@ public abstract class DataCache<TKey, TValue> : IDataCache<TKey, TValue>
         return result;
     }
 
+    /// Single-key fetch with coalescing.
+    ///
+    /// GetOrAdd ensures that if two threads call this for the same key simultaneously:
+    ///   Thread A: GetOrAdd(key) → creates Lazy, wins the race → stored in dictionary
+    ///   Thread B: GetOrAdd(key) → sees Thread A's Lazy already there → gets the SAME instance
+    /// Both threads then await the same lazy.Value → same Task → single DB call.
+    ///
+    /// The finally block uses TryRemove with the KeyValuePair overload to only remove
+    /// OUR Lazy instance. If a new request already registered a fresh Lazy for a retry,
+    /// we won't accidentally remove it.
     private async Task<TValue> FetchAndCacheAsync(TKey key)
     {
         var lazy = _inflightFetches.GetOrAdd(key, k =>
@@ -112,7 +147,6 @@ public abstract class DataCache<TKey, TValue> : IDataCache<TKey, TValue>
         }
         finally
         {
-            // Remove only if it's the same Lazy instance (not a new retry)
             _inflightFetches.TryRemove(new KeyValuePair<TKey, Lazy<Task<TValue>>>(key, lazy));
         }
     }
